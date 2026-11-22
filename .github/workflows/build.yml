@@ -1,0 +1,125 @@
+name: sandbox image
+
+on:
+  pull_request:
+    paths: [Containerfile, smoke.sh, .github/workflows/build.yml]
+  push:
+    branches: [main]
+    paths: [Containerfile, smoke.sh, .github/workflows/build.yml]
+  schedule:
+    - cron: '47 3 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_digest:
+        description: Override the upstream arm64 digest
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sandbox-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/slopervisor/hermes-sandbox
+  UPSTREAM_REPO: nousresearch/hermes-sandbox
+  UPSTREAM_TAG: desktop
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.upstream.outputs.digest }}
+      changed: ${{ steps.compare.outputs.changed }}
+    steps:
+      - name: Read the upstream arm64 digest
+        id: upstream
+        env:
+          OVERRIDE: ${{ inputs.upstream_digest }}
+        run: |
+          if [ -n "$OVERRIDE" ]; then
+            digest="$OVERRIDE"
+          else
+            digest=$(curl -fsSL "https://hub.docker.com/v2/repositories/${UPSTREAM_REPO}/tags/${UPSTREAM_TAG}" \
+              | jq -r '.images[] | select(.architecture == "arm64") | .digest')
+          fi
+          case "$digest" in sha256:*) ;; *) echo "bad digest: $digest"; exit 1 ;; esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Compare with the published image
+        id: compare
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+          published=$(skopeo inspect --config --override-arch arm64 "docker://${IMAGE}:latest" 2>/dev/null \
+            | jq -r '.config.Labels["org.opencontainers.image.base.digest"] // empty' || true)
+          if [ "$published" = "${{ steps.upstream.outputs.digest }}" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: github.event_name != 'schedule' || needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build for the pull request
+        if: github.event_name == 'pull_request'
+        run: |
+          docker buildx build --platform linux/arm64 --load \
+            --build-arg UPSTREAM_REF="docker.io/${UPSTREAM_REPO}@${{ needs.check.outputs.digest }}" \
+            --build-arg UPSTREAM_DIGEST="${{ needs.check.outputs.digest }}" \
+            -t "${IMAGE}:test" -f Containerfile .
+      - name: Build and push the immutable tags
+        if: github.event_name != 'pull_request'
+        run: |
+          short=$(git rev-parse --short=12 HEAD)
+          up=${{ needs.check.outputs.digest }}
+          up=${up#sha256:}
+          docker buildx build --platform linux/arm64 --push \
+            --build-arg UPSTREAM_REF="docker.io/${UPSTREAM_REPO}@${{ needs.check.outputs.digest }}" \
+            --build-arg UPSTREAM_DIGEST="${{ needs.check.outputs.digest }}" \
+            --provenance=mode=max --sbom=true \
+            -t "${IMAGE}:sha-${short}" \
+            -t "${IMAGE}:date-$(date -u +%Y%m%d)" \
+            -t "${IMAGE}:upstream-${up:0:12}" \
+            -f Containerfile .
+      - name: Smoke the pull-request image
+        if: github.event_name == 'pull_request'
+        run: |
+          docker rm -f sbx >/dev/null 2>&1 || true
+          docker run -d --name sbx "${IMAGE}:test"
+          docker exec -u pn sbx sandbox-selfcheck
+          docker rm -f sbx
+      - name: Smoke the pushed image
+        if: github.event_name != 'pull_request'
+        run: |
+          short=$(git rev-parse --short=12 HEAD)
+          docker rm -f sbx >/dev/null 2>&1 || true
+          docker pull "${IMAGE}:sha-${short}"
+          docker run -d --name sbx "${IMAGE}:sha-${short}"
+          docker exec -u pn sbx sandbox-selfcheck
+          docker rm -f sbx
+      - name: Record the image size
+        if: github.event_name != 'pull_request'
+        run: |
+          short=$(git rev-parse --short=12 HEAD)
+          docker image inspect --format '{{.Size}}' "${IMAGE}:sha-${short}" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Move latest
+        if: github.event_name != 'pull_request'
+        run: |
+          short=$(git rev-parse --short=12 HEAD)
+          docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:sha-${short}"
